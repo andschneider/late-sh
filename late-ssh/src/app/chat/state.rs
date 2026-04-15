@@ -46,7 +46,6 @@ pub struct ChatState {
     event_rx: tokio::sync::broadcast::Receiver<ChatEvent>,
     pub(crate) rooms: Vec<(ChatRoom, Vec<ChatMessage>)>,
     general_room_id: Option<Uuid>,
-    pub(crate) general_messages: Vec<ChatMessage>,
     pub(crate) usernames: HashMap<Uuid, String>,
     ignored_user_ids: HashSet<Uuid>,
     overlay: Option<Overlay>,
@@ -57,6 +56,7 @@ pub struct ChatState {
     pub(crate) composer: String,
     pub(crate) composer_cursor: usize, // char position within composer
     pub(crate) composing: bool,
+    composer_room_id: Option<Uuid>,
     pending_send_notices: VecDeque<Uuid>,
     pub(crate) pending_dm_screen_switch: bool,
     pub(crate) mention_ac: MentionAutocomplete,
@@ -64,6 +64,7 @@ pub struct ChatState {
     pub(crate) bonsai_glyphs: HashMap<Uuid, String>,
     pub(crate) selected_message_id: Option<Uuid>,
     pub(crate) highlighted_message_id: Option<Uuid>,
+    pub(crate) edited_message_id: Option<Uuid>,
     pub(crate) reply_target: Option<ReplyTarget>,
     bg_task: tokio::task::AbortHandle,
 
@@ -120,7 +121,6 @@ impl ChatState {
             event_rx,
             rooms: Vec::new(),
             general_room_id: None,
-            general_messages: Vec::new(),
             usernames: HashMap::new(),
             ignored_user_ids: HashSet::new(),
             overlay: None,
@@ -131,6 +131,7 @@ impl ChatState {
             composer: String::new(),
             composer_cursor: 0,
             composing: false,
+            composer_room_id: None,
             pending_send_notices: VecDeque::new(),
             pending_dm_screen_switch: false,
             mention_ac: MentionAutocomplete::default(),
@@ -138,6 +139,7 @@ impl ChatState {
             bonsai_glyphs: HashMap::new(),
             selected_message_id: None,
             highlighted_message_id: None,
+            edited_message_id: None,
             reply_target: None,
             bg_task,
             composer_text_width: 80,
@@ -181,10 +183,18 @@ impl ChatState {
     }
 
     pub fn start_composing(&mut self) {
+        if let Some(room_id) = self.selected_room_id {
+            self.start_composing_in_room(room_id);
+        }
+    }
+
+    pub fn start_composing_in_room(&mut self, room_id: Uuid) {
         self.composing = true;
+        self.composer_room_id = Some(room_id);
         self.composer_cursor = self.composer.chars().count();
         self.selected_message_id = None;
         self.reply_target = None;
+        self.edited_message_id = None;
     }
 
     pub fn request_list(&self) {
@@ -217,11 +227,8 @@ impl ChatState {
         self.service.mark_room_read_task(self.user_id, room_id);
     }
 
-    /// Returns visible messages for the selected room.
-    fn visible_room_messages(&self) -> Vec<&ChatMessage> {
-        let Some(room_id) = self.selected_room_id else {
-            return Vec::new();
-        };
+    /// Returns visible messages for the given room.
+    fn visible_messages_for_room(&self, room_id: Uuid) -> Vec<&ChatMessage> {
         self.rooms
             .iter()
             .find(|(room, _)| room.id == room_id)
@@ -267,18 +274,15 @@ impl ChatState {
         self.selected_message_id = Some(ids[new_idx]);
     }
 
-    /// Move message cursor on the dashboard general chat.
-    pub fn select_dashboard_message(&mut self, delta: isize) {
-        self.highlighted_message_id = None;
-        let ids: Vec<Uuid> = self.general_messages.iter().map(|m| m.id).collect();
-        self.select_from_ids(&ids, delta);
-    }
-
     /// Move message cursor by delta. Positive = toward older, negative = toward newer.
     /// First press activates cursor on the newest message.
-    pub fn select_message(&mut self, delta: isize) {
+    pub fn select_message_in_room(&mut self, room_id: Uuid, delta: isize) {
         self.highlighted_message_id = None;
-        let ids: Vec<Uuid> = self.visible_room_messages().iter().map(|m| m.id).collect();
+        let ids: Vec<Uuid> = self
+            .visible_messages_for_room(room_id)
+            .iter()
+            .map(|m| m.id)
+            .collect();
         self.select_from_ids(&ids, delta);
     }
 
@@ -286,24 +290,60 @@ impl ChatState {
         self.selected_message_id = None;
     }
 
-    pub fn begin_reply_to_selected(&mut self) -> bool {
-        let Some(message) = self.selected_message() else {
+    pub fn begin_reply_to_selected_in_room(&mut self, room_id: Uuid) -> bool {
+        let Some(message) = self.selected_message_in_room(room_id) else {
             return false;
         };
+        let message_user_id = message.user_id;
+        let message_body = message.body.clone();
         let author = self
             .usernames
-            .get(&message.user_id)
+            .get(&message_user_id)
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| short_user_id(message.user_id));
+            .unwrap_or_else(|| short_user_id(message_user_id));
         self.reply_target = Some(ReplyTarget {
             author,
-            preview: reply_preview_text(&message.body),
+            preview: reply_preview_text(&message_body),
         });
         self.composing = true;
+        self.composer_room_id = Some(room_id);
         self.composer_cursor = self.composer.chars().count();
+        self.edited_message_id = None;
         true
+    }
+
+    pub fn begin_edit_selected_in_room(&mut self, room_id: Uuid) -> Option<Banner> {
+        let selected_id = self.selected_message_id?;
+        let Some(message) = self.find_message_in_room(room_id, selected_id) else {
+            return Some(Banner::error("Selected message not found"));
+        };
+        let message_user_id = message.user_id;
+        let room_id = message.room_id;
+        let body = message.body.clone();
+        self.begin_edit_message(selected_id, message_user_id, room_id, &body)
+    }
+
+    fn begin_edit_message(
+        &mut self,
+        selected_id: Uuid,
+        message_user_id: Uuid,
+        room_id: Uuid,
+        body: &str,
+    ) -> Option<Banner> {
+        let is_own = message_user_id == self.user_id;
+        if !is_own && !self.is_admin {
+            return Some(Banner::error("Can only edit your own messages"));
+        }
+        self.edited_message_id = Some(selected_id);
+        self.composer.clear();
+        self.composer.push_str(body);
+        self.composing = true;
+        self.composer_room_id = Some(room_id);
+        self.composer_cursor = self.composer.chars().count();
+        self.invalidate_composer_layout();
+        None
     }
 
     pub(crate) fn reply_target(&self) -> Option<&ReplyTarget> {
@@ -311,19 +351,14 @@ impl ChatState {
     }
 
     /// Delete the selected message if owned by user (or if admin).
-    pub fn delete_selected_message(&mut self) -> Option<Banner> {
+    /// Moves selection to the adjacent message (prefer the next/older one,
+    /// fall back to the previous/newer one) so pressing `d` repeatedly
+    /// cleanly reaps a run of own messages without the cursor jumping
+    /// back to the newest every time.
+    pub fn delete_selected_message_in_room(&mut self, room_id: Uuid) -> Option<Banner> {
         let selected_id = self.selected_message_id?;
-        // Find the message in general messages or in the selected room
         let msg_user_id = self
-            .general_messages
-            .iter()
-            .find(|m| m.id == selected_id)
-            .or_else(|| {
-                self.rooms
-                    .iter()
-                    .flat_map(|(_, msgs)| msgs.iter())
-                    .find(|m| m.id == selected_id)
-            })
+            .find_message_in_room(room_id, selected_id)
             .map(|m| m.user_id)?;
         let is_own = msg_user_id == self.user_id;
         if !is_own && !self.is_admin {
@@ -331,31 +366,24 @@ impl ChatState {
         }
         self.service
             .delete_message_task(self.user_id, selected_id, self.is_admin);
-
-        // Move selection to the adjacent message (prefer the next/older one,
-        // fall back to the previous/newer one) so pressing `d` repeatedly
-        // cleanly reaps a run of own messages without the cursor jumping
-        // back to the newest every time.
-        self.selected_message_id = adjacent_message_id(&self.general_messages, selected_id)
-            .or_else(|| {
-                self.rooms
-                    .iter()
-                    .find_map(|(_, msgs)| adjacent_message_id(msgs, selected_id))
-            });
+        self.selected_message_id = self
+            .rooms
+            .iter()
+            .find(|(room, _)| room.id == room_id)
+            .and_then(|(_, msgs)| adjacent_message_id(msgs, selected_id));
         Some(Banner::success("Deleting message..."))
     }
 
-    fn selected_message(&self) -> Option<&ChatMessage> {
+    fn selected_message_in_room(&self, room_id: Uuid) -> Option<&ChatMessage> {
         let selected_id = self.selected_message_id?;
-        self.general_messages
+        self.find_message_in_room(room_id, selected_id)
+    }
+
+    fn find_message_in_room(&self, room_id: Uuid, message_id: Uuid) -> Option<&ChatMessage> {
+        self.rooms
             .iter()
-            .find(|m| m.id == selected_id)
-            .or_else(|| {
-                self.rooms
-                    .iter()
-                    .flat_map(|(_, msgs)| msgs.iter())
-                    .find(|m| m.id == selected_id)
-            })
+            .find(|(room, _)| room.id == room_id)
+            .and_then(|(_, msgs)| msgs.iter().find(|m| m.id == message_id))
     }
 
     fn selected_room_slug(&self) -> Option<String> {
@@ -370,26 +398,13 @@ impl ChatState {
             .map(|(room, _)| room)
     }
 
-    pub fn select_general_room(&mut self) {
-        if let Some(room_id) = self.general_room_id
-            && self.rooms.iter().any(|(room, _)| room.id == room_id)
-        {
-            self.selected_room_id = Some(room_id);
-            return;
-        }
-
-        if let Some((room, _)) = self
-            .rooms
-            .iter()
-            .find(|(room, _)| room.kind == "general" && room.slug.as_deref() == Some("general"))
-        {
-            self.selected_room_id = Some(room.id);
-            return;
-        }
-
-        if self.selected_room_id.is_none() {
-            self.sync_selection();
-        }
+    pub fn general_room_id(&self) -> Option<Uuid> {
+        self.general_room_id.or_else(|| {
+            self.rooms
+                .iter()
+                .find(|(room, _)| room.kind == "general" && room.slug.as_deref() == Some("general"))
+                .map(|(room, _)| room.id)
+        })
     }
 
     fn dm_display_name(&self, room: &ChatRoom) -> String {
@@ -510,15 +525,29 @@ impl ChatState {
 
     pub fn stop_composing(&mut self) {
         self.composing = false;
+        self.composer_room_id = None;
         self.composer_cursor = self.composer.chars().count();
         self.reply_target = None;
+    }
+
+    pub fn reset_composer(&mut self) {
+        self.composer.clear();
+        self.composer_cursor = 0;
+        self.composing = false;
+        self.composer_room_id = None;
+        self.reply_target = None;
+        self.edited_message_id = None;
+        self.mention_ac = MentionAutocomplete::default();
+        self.invalidate_composer_layout();
     }
 
     fn clear_composer_after_submit(&mut self) {
         self.composer.clear();
         self.composer_cursor = 0;
         self.composing = false;
+        self.composer_room_id = None;
         self.reply_target = None;
+        self.edited_message_id = None;
         self.invalidate_composer_layout();
     }
 
@@ -651,7 +680,7 @@ impl ChatState {
             return Some(Banner::success(&format!("Deleting #{slug}...")));
         }
 
-        if let Some(room_id) = self.selected_room_id
+        if let Some(room_id) = self.composer_room_id
             && !body.is_empty()
         {
             let request_id = Uuid::now_v7();
@@ -660,14 +689,24 @@ impl ChatState {
             } else {
                 body
             };
-            self.service.send_message_task(
-                self.user_id,
-                room_id,
-                self.selected_room_slug(),
-                body,
-                request_id,
-                self.is_admin,
-            );
+            if let Some(message_id) = self.edited_message_id {
+                self.service.edit_message_task(
+                    self.user_id,
+                    message_id,
+                    body,
+                    request_id,
+                    self.is_admin,
+                );
+            } else {
+                self.service.send_message_task(
+                    self.user_id,
+                    room_id,
+                    self.selected_room_slug(),
+                    body,
+                    request_id,
+                    self.is_admin,
+                );
+            }
             self.pending_send_notices.push_back(request_id);
         }
         self.clear_composer_after_submit();
@@ -984,7 +1023,14 @@ impl ChatState {
     }
 
     pub fn general_messages(&self) -> &[ChatMessage] {
-        &self.general_messages
+        let Some(general_id) = self.general_room_id else {
+            return &[];
+        };
+        self.rooms
+            .iter()
+            .find(|(room, _)| room.id == general_id)
+            .map(|(_, msgs)| msgs.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn usernames(&self) -> &HashMap<Uuid, String> {
@@ -1009,7 +1055,6 @@ impl ChatState {
         self.ignored_user_ids = snapshot.ignored_user_ids.into_iter().collect();
         self.rooms = self.merge_rooms(snapshot.chat_rooms);
         self.general_room_id = snapshot.general_room_id;
-        self.general_messages = self.filter_messages(snapshot.general_messages);
         self.unread_counts = self.merge_unread_counts(snapshot.unread_counts);
         self.all_usernames = snapshot.all_usernames;
         self.bonsai_glyphs = snapshot.bonsai_glyphs;
@@ -1148,6 +1193,32 @@ impl ChatState {
                         banner = Some(Banner::success("Message deleted"));
                     }
                 }
+                ChatEvent::MessageEdited {
+                    message,
+                    target_user_ids,
+                } => {
+                    if let Some(targets) = target_user_ids
+                        && !targets.contains(&self.user_id)
+                    {
+                        continue;
+                    }
+                    self.replace_message(message);
+                }
+                ChatEvent::EditSucceeded {
+                    user_id,
+                    request_id,
+                } if self.user_id == user_id => {
+                    self.pending_send_notices.retain(|id| *id != request_id);
+                    banner = Some(Banner::success("Message edited"));
+                }
+                ChatEvent::EditFailed {
+                    user_id,
+                    request_id,
+                    message,
+                } if self.user_id == user_id => {
+                    self.pending_send_notices.retain(|id| *id != request_id);
+                    banner = Some(Banner::error(&message));
+                }
                 ChatEvent::DeleteFailed { user_id, message } if self.user_id == user_id => {
                     banner = Some(Banner::error(&message));
                 }
@@ -1191,21 +1262,7 @@ impl ChatState {
             return;
         }
 
-        if Some(message.room_id) == self.general_room_id
-            && !self
-                .general_messages
-                .iter()
-                .any(|existing| existing.id == message.id)
-        {
-            self.general_messages.insert(0, message.clone());
-            if self.general_messages.len() > 1000 {
-                self.general_messages.truncate(1000);
-            }
-        }
-
-        if Some(message.room_id) != self.selected_room_id {
-            return;
-        }
+        let is_viewing_room = Some(message.room_id) == self.selected_room_id;
 
         let Some((_, messages)) = self
             .rooms
@@ -1220,17 +1277,33 @@ impl ChatState {
         }
 
         // Service snapshots are newest-first; keep same order for cheap appends at the front.
+        let room_id = message.room_id;
         messages.insert(0, message);
-        self.unread_counts.insert(messages[0].room_id, 0);
         if messages.len() > 1000 {
             messages.truncate(1000);
+        }
+
+        // Only mark the room as read if the user is actually viewing it.
+        // Other warm rooms keep their unread badge until the user opens them.
+        if is_viewing_room {
+            self.unread_counts.insert(room_id, 0);
         }
     }
 
     fn remove_message(&mut self, room_id: Uuid, message_id: Uuid) {
-        self.general_messages.retain(|m| m.id != message_id);
         if let Some((_, messages)) = self.rooms.iter_mut().find(|(room, _)| room.id == room_id) {
             messages.retain(|m| m.id != message_id);
+        }
+    }
+
+    fn replace_message(&mut self, message: ChatMessage) {
+        if let Some((_, messages)) = self
+            .rooms
+            .iter_mut()
+            .find(|(room, _)| room.id == message.room_id)
+            && let Some(existing) = messages.iter_mut().find(|m| m.id == message.id)
+        {
+            *existing = message;
         }
     }
 
@@ -1294,8 +1367,6 @@ impl ChatState {
     /// DM rooms are exempt — leaving the DM room is the way to dismiss them.
     fn refilter_local_messages(&mut self) {
         let ignored = &self.ignored_user_ids;
-        self.general_messages
-            .retain(|m| !ignored.contains(&m.user_id));
         for (room, messages) in &mut self.rooms {
             if room.kind == "dm" {
                 continue;

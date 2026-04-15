@@ -36,7 +36,6 @@ pub struct ChatSnapshot {
     pub user_id: Option<Uuid>,
     pub chat_rooms: Vec<(ChatRoom, Vec<ChatMessage>)>,
     pub general_room_id: Option<Uuid>,
-    pub general_messages: Vec<ChatMessage>,
     pub usernames: HashMap<Uuid, String>,
     pub unread_counts: HashMap<Uuid, i64>,
     pub all_usernames: Vec<String>,
@@ -50,19 +49,32 @@ pub enum ChatEvent {
         message: ChatMessage,
         target_user_ids: Option<Vec<Uuid>>,
     },
+    MessageEdited {
+        message: ChatMessage,
+        target_user_ids: Option<Vec<Uuid>>,
+    },
     SendSucceeded {
         user_id: Uuid,
         request_id: Uuid,
-    },
-    DeltaSynced {
-        user_id: Uuid,
-        room_id: Uuid,
-        messages: Vec<ChatMessage>,
     },
     SendFailed {
         user_id: Uuid,
         request_id: Uuid,
         message: String,
+    },
+    EditSucceeded {
+        user_id: Uuid,
+        request_id: Uuid,
+    },
+    EditFailed {
+        user_id: Uuid,
+        request_id: Uuid,
+        message: String,
+    },
+    DeltaSynced {
+        user_id: Uuid,
+        room_id: Uuid,
+        messages: Vec<ChatMessage>,
     },
     DmOpened {
         user_id: Uuid,
@@ -190,6 +202,10 @@ impl ChatService {
         } else {
             Vec::new()
         };
+        // General is the dashboard's permanent room — it must always carry
+        // its tail in the snapshot so the dashboard card stays warm even when
+        // the chat page has another room selected. Other non-selected rooms
+        // ride on broadcasts + a backfill on first open per session.
         let usernames = User::list_all_username_map(client).await?;
         let mut all_usernames: Vec<String> = usernames.values().cloned().collect();
         all_usernames.sort();
@@ -212,6 +228,8 @@ impl ChatService {
             .map(|chat| {
                 let messages = if Some(chat.id) == active_room_id {
                     selected_messages.clone()
+                } else if Some(chat.id) == general_room_id {
+                    general_messages.clone()
                 } else {
                     Vec::new()
                 };
@@ -223,7 +241,6 @@ impl ChatService {
             user_id: Some(user_id),
             chat_rooms: rooms,
             general_room_id,
-            general_messages,
             usernames,
             unread_counts,
             all_usernames,
@@ -368,50 +385,6 @@ impl ChatService {
         );
     }
 
-    #[tracing::instrument(skip(self, body), fields(user_id = %user_id, room_id = %room_id, body_len = body.len()))]
-    async fn send_message(
-        &self,
-        user_id: Uuid,
-        room_id: Uuid,
-        room_slug: Option<String>,
-        body: String,
-        is_admin: bool,
-    ) -> Result<()> {
-        let body = body.trim_start_matches('\n').trim_end();
-        if body.is_empty() {
-            return Ok(());
-        }
-
-        if room_slug.as_deref() == Some("announcements") && !is_admin {
-            anyhow::bail!("announcements is admin-only");
-        }
-
-        let client = &self.db.get().await?;
-        let is_member = ChatRoomMember::is_member(client, room_id, user_id).await?;
-        if !is_member {
-            anyhow::bail!("user is not a member of room");
-        }
-
-        let message = ChatMessageParams {
-            room_id,
-            user_id,
-            body: body.to_string(),
-        };
-        let chat = ChatMessage::create(client, message).await?;
-        ChatRoom::touch_updated(client, room_id).await?;
-        ChatRoomMember::mark_read_now(client, room_id, user_id).await?;
-        let target_user_ids = ChatRoom::get_target_user_ids(client, room_id).await?;
-        let _ = self.evt_tx.send(ChatEvent::MessageCreated {
-            message: chat.clone(),
-            target_user_ids,
-        });
-        metrics::record_chat_message_sent();
-        self.notification_svc
-            .create_mentions_task(user_id, chat.id, room_id, body.to_string());
-        tracing::info!(chat_id = %chat.id, "message sent");
-        Ok(())
-    }
-
     pub fn send_message_task(
         &self,
         user_id: Uuid,
@@ -464,30 +437,130 @@ impl ChatService {
         );
     }
 
-    #[tracing::instrument(skip(self, body), fields(user_id = %user_id, body_len = body.len()))]
-    async fn send_to_general(&self, user_id: Uuid, body: String) -> Result<()> {
+    #[tracing::instrument(skip(self, body), fields(user_id = %user_id, room_id = %room_id, body_len = body.len()))]
+    async fn send_message(
+        &self,
+        user_id: Uuid,
+        room_id: Uuid,
+        room_slug: Option<String>,
+        body: String,
+        is_admin: bool,
+    ) -> Result<()> {
         let body = body.trim_start_matches('\n').trim_end();
         if body.is_empty() {
             return Ok(());
         }
 
-        // Block-scope: find the room ID, then drop the client before calling
-        // send_message (which acquires its own).
-        let room_id = {
-            let client = self.db.get().await?;
-            ChatRoom::find_general(&client)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("general room missing"))?
-                .id
-        };
-        self.send_message(
-            user_id,
+        if room_slug.as_deref() == Some("announcements") && !is_admin {
+            anyhow::bail!("announcements is admin-only");
+        }
+
+        let client = &self.db.get().await?;
+        let is_member = ChatRoomMember::is_member(client, room_id, user_id).await?;
+        if !is_member {
+            anyhow::bail!("user is not a member of room");
+        }
+
+        let message = ChatMessageParams {
             room_id,
-            Some("general".to_string()),
-            body.to_string(),
-            false,
-        )
-        .await
+            user_id,
+            body: body.to_string(),
+        };
+        let chat = ChatMessage::create(client, message).await?;
+        ChatRoom::touch_updated(client, room_id).await?;
+        ChatRoomMember::mark_read_now(client, room_id, user_id).await?;
+        let target_user_ids = ChatRoom::get_target_user_ids(client, room_id).await?;
+        let _ = self.evt_tx.send(ChatEvent::MessageCreated {
+            message: chat.clone(),
+            target_user_ids,
+        });
+        metrics::record_chat_message_sent();
+        self.notification_svc
+            .create_mentions_task(user_id, chat.id, room_id, body.to_string());
+        tracing::info!(chat_id = %chat.id, "message sent");
+        Ok(())
+    }
+
+    pub fn edit_message_task(
+        &self,
+        user_id: Uuid,
+        message_id: Uuid,
+        new_body: String,
+        request_id: Uuid,
+        is_admin: bool,
+    ) {
+        let service = self.clone();
+        tokio::spawn(
+            async move {
+                match service
+                    .edit_message(user_id, message_id, new_body, is_admin)
+                    .await
+                {
+                    Err(e) => {
+                        let message = if e.to_string().contains("Cannot edit") {
+                            "You can only edit your own messages."
+                        } else if e.to_string().contains("empty") {
+                            "Edited message cannot be empty."
+                        } else {
+                            "Could not edit message. Please try again."
+                        };
+                        let _ = service.evt_tx.send(ChatEvent::EditFailed {
+                            user_id,
+                            request_id,
+                            message: message.to_string(),
+                        });
+                    }
+                    Ok(()) => {
+                        let _ = service.evt_tx.send(ChatEvent::EditSucceeded {
+                            user_id,
+                            request_id,
+                        });
+                    }
+                }
+            }
+            .instrument(info_span!(
+                "chat.edit_message_task",
+                user_id = %user_id,
+                message_id = %message_id,
+                request_id = %request_id
+            )),
+        );
+    }
+
+    #[tracing::instrument(skip(self, new_body), fields(user_id = %user_id, message_id = %message_id, body_len = new_body.len()))]
+    async fn edit_message(
+        &self,
+        user_id: Uuid,
+        message_id: Uuid,
+        new_body: String,
+        is_admin: bool,
+    ) -> Result<()> {
+        let new_body = new_body.trim_start_matches('\n').trim_end();
+        if new_body.is_empty() {
+            anyhow::bail!("edited body is empty");
+        }
+
+        let client = &self.db.get().await?;
+        let existing = ChatMessage::get(client, message_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("message not found"))?;
+        if existing.user_id != user_id && !is_admin {
+            anyhow::bail!("cannot edit this message");
+        }
+
+        let params = ChatMessageParams {
+            room_id: existing.room_id,
+            user_id: existing.user_id,
+            body: new_body.to_string(),
+        };
+        let updated = ChatMessage::update(client, message_id, params).await?;
+        let target_user_ids = ChatRoom::get_target_user_ids(client, existing.room_id).await?;
+        let _ = self.evt_tx.send(ChatEvent::MessageEdited {
+            message: updated,
+            target_user_ids,
+        });
+        metrics::record_chat_message_edited();
+        Ok(())
     }
 
     pub fn start_dm_task(&self, user_id: Uuid, target_username: String) {
@@ -735,22 +808,6 @@ impl ChatService {
         }
         ChatRoomMember::leave(client, room_id, user_id).await?;
         Ok(())
-    }
-
-    pub fn send_to_general_task(&self, user_id: Uuid, body: String) {
-        let service = self.clone();
-        tokio::spawn(
-            async move {
-                if let Err(e) = service.send_to_general(user_id, body).await {
-                    late_core::error_span!(
-                        "chat_send_general_failed",
-                        error = ?e,
-                        "failed to send message to general room"
-                    );
-                }
-            }
-            .instrument(info_span!("chat.send_to_general_task", user_id = %user_id)),
-        );
     }
 
     pub fn create_room_task(&self, user_id: Uuid, slug: String) {
